@@ -1,0 +1,20 @@
+# Data
+data/
+*.csv
+
+# Models
+models/
+*.pkl
+
+# MLflow logs
+logs/mlruns/
+mlnruns/
+
+# Python
+__pycache__/
+*.pyc
+
+# Env
+.env
+.venv
+.conda
