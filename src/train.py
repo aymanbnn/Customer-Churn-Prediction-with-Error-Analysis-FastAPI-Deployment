@@ -2,6 +2,7 @@ import os
 import random
 import numpy as np
 from sklearn.discriminant_analysis import StandardScaler
+from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_recall_curve, precision_recall_curve, precision_score, recall_score, roc_auc_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -25,6 +26,7 @@ mlflow.xgboost.autolog(registered_model_name="XGBoostChurnModel")
 
 with mlflow.start_run(run_name="logistic_regression"):
     lr_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
         ("scaler", StandardScaler()),
         ("model", LogisticRegression(max_iter=1000, random_state=seed))
     ])
