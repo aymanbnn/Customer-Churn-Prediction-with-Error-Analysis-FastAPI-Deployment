@@ -47,6 +47,9 @@ def load_data(path="data/churn.csv"):
         df = df.drop(columns=["customerID"])
 
     df["TotalCharges"] = pd.to_numeric(df["TotalCharges"], errors="coerce")
+    df['TotalCharges'].fillna(df['TotalCharges'].median(), inplace=True)
+    df['MonthlyCharges'].fillna(df['MonthlyCharges'].median(), inplace=True)
+    df['tenure'].fillna(df['tenure'].median(), inplace=True)
 
     df = engineer_features(df)
 

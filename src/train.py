@@ -1,9 +1,11 @@
 import os
 import random
 import numpy as np
-from sklearn.discriminant_analysis import StandardScaler
+import optuna
+from imblearn.over_sampling import SMOTE
+from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_recall_curve, precision_recall_curve, precision_score, recall_score, roc_auc_score
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, precision_recall_curve, precision_score, recall_score, roc_auc_score
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
 from sklearn.pipeline import Pipeline
@@ -16,6 +18,14 @@ random.seed(seed)
 np.random.seed(seed)
 
 X_train, X_test, y_train, y_test = load_data()
+
+smote = SMOTE(random_state=seed, k_neighbors=5)
+X_train_balanced, y_train_balanced = smote.fit_resample(X_train, y_train)
+
+print("Original class distribution:")
+print(y_train.value_counts())
+print("\nResampled class distribution:")
+print(y_train_balanced.value_counts())
 
 os.makedirs("logs/mlruns", exist_ok=True)
 mlflow.set_tracking_uri("./logs/mlruns")
@@ -44,7 +54,6 @@ def run_cv_with_threshold(model, X, y):
 
     f1_scores, precisions, recalls, aucs = [], [], [], []
     thresholds = []
-    best_iterations = []
 
     for train_idx, val_idx in skf.split(X, y):
         X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
@@ -69,7 +78,6 @@ def run_cv_with_threshold(model, X, y):
         recalls.append(recall_score(y_val, y_pred))
         aucs.append(roc_auc_score(y_val, y_proba))
         thresholds.append(best_t)
-        best_iterations.append(model_clone.best_iteration)
 
     return {
         "f1_mean": np.mean(f1_scores),
@@ -82,7 +90,6 @@ def run_cv_with_threshold(model, X, y):
         "roc_auc_std": np.std(aucs),
         "threshold_mean": np.mean(thresholds),
         "threshold_std": np.std(thresholds),
-        "best_n_estimators": int(np.mean(best_iterations))
     }
 
 def find_best_threshold(y_true, y_proba):
@@ -94,6 +101,33 @@ def find_best_threshold(y_true, y_proba):
     return thresholds[best_idx], f1_scores[best_idx], precision[best_idx], recall[best_idx]
 
 
+def objective(trial):
+    params = {
+        'max_depth': trial.suggest_int('max_depth', 3, 6),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+        'n_estimators': trial.suggest_int('n_estimators', 30, 200),
+        'subsample': trial.suggest_float('subsample', 0.5, 1.0),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0),
+        'min_child_weight': trial.suggest_int('min_child_weight', 1, 10),
+        'gamma': trial.suggest_float('gamma', 0, 5),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-4, 1, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-4, 1, log=True),
+    }
+    
+    model = XGBClassifier(
+        **params, 
+        random_state=seed, 
+        early_stopping_rounds=20, 
+        tree_method='hist',
+        device='cuda'
+    )
+    
+    cv_results = run_cv_with_threshold(model, X_train_balanced, y_train_balanced)
+    
+    return float(cv_results["f1_mean"])
+
+
+
 with mlflow.start_run(run_name="logistic_regression"):
     lr_pipeline = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
@@ -101,12 +135,12 @@ with mlflow.start_run(run_name="logistic_regression"):
         ("model", LogisticRegression(max_iter=1000, random_state=seed))
     ])
 
-    cv_metrics = run_cross_validation(lr_pipeline, X_train, y_train)
+    cv_metrics = run_cross_validation(lr_pipeline, X_train_balanced, y_train_balanced)
 
     for k, v in cv_metrics.items():
-        mlflow.log_metric(k, v)
+        mlflow.log_metric(k, float(v))
 
-    lr_pipeline.fit(X_train, y_train)
+    lr_pipeline.fit(X_train_balanced, y_train_balanced)
     y_pred_lr = lr_pipeline.predict(X_test)
 
     # Logistic Regression false negatives
@@ -119,26 +153,31 @@ with mlflow.start_run(run_name="logistic_regression"):
 mlflow.end_run()
 
 
+sampler = optuna.samplers.TPESampler(seed=seed)
+pruner = optuna.pruners.MedianPruner()
+study = optuna.create_study(direction='maximize', sampler=sampler, pruner=pruner)
+study.optimize(objective, n_trials=50, show_progress_bar=True)
+
+best_trial = study.best_trial
+
 with mlflow.start_run(run_name="xgboost_churn"):
     model = XGBClassifier(
-        n_estimators=300,
-        learning_rate=0.03,
-        max_depth=5,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        scale_pos_weight=len(y_train[y_train == 0]) / len(y_train[y_train == 1]),
+        **best_trial.params,
+        scale_pos_weight=len(y_train_balanced[y_train_balanced == 0]) / len(y_train_balanced[y_train_balanced == 1]),
         random_state=seed,
         eval_metric=["logloss", "auc"],
-        early_stopping_rounds=20
+        early_stopping_rounds=20,
+        tree_method='hist',
+        device='cuda'
     )
 
-    cv_metrics = run_cv_with_threshold(model, X_train, y_train)
+    cv_metrics = run_cv_with_threshold(model, X_train_balanced, y_train_balanced)
 
     for k, v in cv_metrics.items():
-        mlflow.log_metric(k, v)
+        mlflow.log_metric(k, float(v))
     
     X_tr, X_val, y_tr, y_val = train_test_split(
-        X_train, y_train, test_size=0.2, stratify=y_train, random_state=seed
+        X_train_balanced, y_train_balanced, test_size=0.2, stratify=y_train_balanced, random_state=seed
     )
     
     model.fit(
@@ -150,6 +189,8 @@ with mlflow.start_run(run_name="xgboost_churn"):
     y_proba = model.predict_proba(X_test)[:, 1]
 
     y_pred = (y_proba >= cv_metrics["threshold_mean"]).astype(int)
+
+    mlflow.log_param("decision_threshold", float(cv_metrics["threshold_mean"]))
     
     # Metrics
     f1_xgb = f1_score(y_test, y_pred)
